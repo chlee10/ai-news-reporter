@@ -1,46 +1,83 @@
 # AI News Reporter
 
-매일 오전 8시, 정오, 오후 5시(Asia/Seoul)에 국내외 AI 뉴스를 수집해 중복 제거, 출처 검증, 중요도 평가, 리포트 생성, Gmail 발송까지 수행합니다. 각 실행의 품질 지표와 개선 제안은 SQLite에 저장되며 다음 리포트의 편집 원칙에 반영됩니다.
+매일 오전 8시, 정오, 오후 5시(Asia/Seoul)에 국내외 AI 뉴스를 수집해 중복 제거, 출처 검증, 중요도 평가, 리포트 생성, Gmail 발송까지 수행합니다.
+
+각 실행은 **자기 자신을 계측하고 다음 실행의 편집 정책을 직접 고쳐 씁니다.** 지표는 SQLite에 남고, 정책(가중치·국내 최소 편성·매체당 상한·매체별 신뢰 보정)은 다음 실행의 랭킹에 실제로 적용됩니다.
 
 ## Setup
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[test,llm]"
+pip install -e ".[test]"
 Copy-Item .env.example .env
 ```
 
-`.env`에 Gmail 주소, [Google App Password](https://myaccount.google.com/apppasswords), 수신자 주소를 입력합니다. 일반 Gmail 비밀번호는 사용할 수 없습니다. 해외 기사 한국어 번역에는 `GEMINI_API_KEY`를 설정합니다. Gemini 오류 시 `OPENAI_API_KEY`, 이어서 Google 번역으로 자동 대체합니다.
+`.env`에 Gmail 주소, [Google App Password](https://myaccount.google.com/apppasswords), 수신자 주소를 입력합니다. 일반 Gmail 비밀번호는 사용할 수 없습니다. 해외 기사 번역과 상세 요약에는 `GEMINI_API_KEY`를 설정합니다. Gemini 실패 시 Google 번역으로 자동 대체되며, **대체가 일어났다는 사실 자체가 지표로 기록**됩니다.
 
 ## Run
 
 ```powershell
-# 수집부터 이메일 발송까지 한 번 실행
-ai-news run
-
-# 이메일 없이 HTML/텍스트 리포트만 확인
-ai-news run --dry-run
-
-# 이미 발송한 기사를 포함해 개선된 리포트를 한 번 다시 발송
-ai-news run --force
-
-# 매일 08:00, 12:00, 17:00 KST 실행 프로세스 시작
-ai-news schedule
+ai-news run              # 수집부터 이메일 발송까지 한 사이클
+ai-news run --dry-run    # 리포트만 출력. 발송·중복기록·정책갱신 모두 하지 않음
+ai-news run --force      # 중복 기억을 무시하고 한 번 재발송
+ai-news run --verbose    # 디버그 로그
+ai-news status           # 현재 편집 정책, 최근 실행 지표, 소스 상태
+ai-news schedule         # 08:00, 12:00, 17:00 KST 상주 실행
 ```
 
-GitHub Actions나 Windows Task Scheduler 같은 외부 스케줄러를 사용할 경우 `ai-news run`을 매일 08:00, 12:00, 17:00 KST에 실행하면 됩니다. `schedule`은 항상 실행 중인 서버/PC용입니다.
+로그는 stderr와 `logs/ai-news.log`(1MB 로테이션, 3세대)에 함께 남습니다. `schedule`은 항상 켜져 있는 서버/PC용이며, GitHub Actions나 Task Scheduler를 쓸 경우 `ai-news run`을 해당 시각에 걸면 됩니다.
+
+## 하네스 루프
+
+```
+수집 → 사건 클러스터링 → 중복 제거 → 정책 기반 랭킹 → 선정
+     → 번역/본문/요약 → 발송 → 계측 → 정책 갱신 ─┐
+     ▲                                            │
+     └────────────── 다음 실행이 읽어감 ───────────┘
+```
+
+1. **수집** — 피드마다 타임아웃 15초, 최대 3회 재시도. 실패·빈 피드는 `source_health`에 기록되며 조용히 넘어가지 않습니다.
+2. **클러스터링** — 제목에서 불용어를 제거한 토큰 집합의 자카드 유사도(≥0.55)로 같은 사건을 묶습니다. 교차 보도는 **서로 다른 도메인 수**로 계산하므로, 한 매체가 같은 소식을 여러 번 올려도 점수가 오르지 않습니다.
+3. **중복 제거** — 발송 이력(fingerprint)과 최근 7일 시그니처를 함께 확인해, 다른 매체가 다시 쓴 같은 사건도 걸러냅니다.
+4. **랭킹** — 신뢰도·최신성·관련성·교차보도 가중치는 **이전 실행이 남긴 정책값**입니다. 매체별 신뢰 보정치가 곱해집니다.
+5. **선정** — 국내 최소 편성(하한)이 매체당 상한보다 우선합니다. 상한 때문에 리포트가 비면 상한을 완화하고 그 사실을 로그로 남깁니다.
+6. **발송** — 성공한 뒤에야 중복 기억에 커밋합니다. SMTP가 실패하면 기사는 미발송 상태로 남아 다음 사이클에 재시도됩니다.
+7. **계측·개선** — 아래 지표를 측정해 다음 정책을 씁니다.
+
+### 측정하는 것
+
+`valid_url_ratio`처럼 상류 필터 때문에 항상 1이 나오는 항목은 쓰지 않습니다. 실제로 변하는 값만 기록합니다.
+
+| 지표 | 정책에 미치는 영향 |
+| --- | --- |
+| 국내 비중 | 25% 미만이면 국내 최소 편성 +1 (최대 6), 50% 초과면 −1 |
+| 출처 다양성 | 5곳 미만이면 매체당 상한 −1 (최소 2) |
+| 기사 중위 연령 | 48시간 초과면 최신성 가중치 +0.03, 신뢰도 −0.03 후 재정규화 |
+| 본문 수집률 | 원문이 막힌 매체의 신뢰 보정치를 0.9배 (하한 0.6), 성공 시 1.05배 회복 |
+| 번역/요약 엔진 | Gemini 실패로 대체됐으면 메모에 기록 |
+| 피드 실패 수 / 발송 성공 여부 | 메모에 기록, 미발송 기사는 유지 |
+
+`ai-news status`로 현재 정책 revision과 최근 실행 지표를 확인할 수 있습니다.
 
 ## Clickable Web Report
 
-Gmail은 이메일 안의 JavaScript와 접기/펼치기 제어를 차단합니다. `.github/workflows/daily-report.yml`은 동일한 리포트를 GitHub Pages에 배포하며, 이메일의 `상세 요약 보기` 링크는 브라우저의 실제 토글 페이지로 연결됩니다. GitHub에 저장소를 만든 뒤 Pages의 Source를 **GitHub Actions**로 설정하고, Actions secrets에 `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`, `REPORT_RECIPIENTS`, `GEMINI_API_KEY`를 등록하세요. `REPORT_PUBLIC_URL`은 `https://계정명.github.io/저장소명` 형식입니다.
+Gmail은 이메일 안의 JavaScript와 접기/펼치기 제어를 차단합니다. `.github/workflows/daily-report.yml`이 동일한 리포트를 GitHub Pages에 배포하고, 이메일의 `상세 요약 보기` 링크가 브라우저의 실제 토글 페이지로 연결됩니다. 웹 리포트 하단에는 그날 실행의 품질 지표 패널이 함께 나옵니다.
 
-## Pipeline
+설정: GitHub에 저장소를 만든 뒤 Pages의 Source를 **GitHub Actions**로 지정하고, Actions secrets에 `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`, `REPORT_RECIPIENTS`, `GEMINI_API_KEY`를 등록합니다.
 
-1. **수집**: 공식 블로그, 국내외 기술 매체 RSS를 읽습니다.
-2. **분석**: 제목/요약을 정규화하고 주제(모델, 정책, 산업, 연구, 안전)를 분류합니다. 해외 기사는 Gemini API로 자연스러운 한국어로 번역하고, 원문 본문을 가져와 기사별 2~3문장 상세 요약을 만듭니다. Gemini 오류 시 OpenAI API, 이어서 Google 번역으로 자동 대체합니다.
-3. **검증**: HTTPS 원문 URL, 허용 도메인, 중복 여부를 확인하고 출처 신뢰도와 교차 출처를 계산합니다.
-4. **평가**: 신뢰도, 최신성, 교차 출처, AI 관련성으로 중요도를 점수화하고 국내 기사를 최대 4건 우선 포함합니다.
-5. **개선**: 누락 URL, 출처 다양성, 상위 기사 품질을 평가해 저장하고 다음 실행 시 편집 가이드로 사용합니다.
+### 상태 지속
 
-소스 추가/수정은 `src/ai_news/sources.py` 또는 `.env`의 `EXTRA_FEEDS`에서 합니다.
+워크플로는 실행이 끝나면 `data/ai_news.db`를 저장소에 되커밋합니다(`contents: write` 권한 필요). 이게 없으면 매 실행이 빈 상태로 시작해 **중복 제거도 정책 누적도 작동하지 않습니다.** `concurrency` 그룹으로 사이클이 겹치지 않게 막아 두었습니다. 실행 로그는 `ai-news-log` 아티팩트로 14일간 보관됩니다.
+
+## 소스 추가
+
+`src/ai_news/sources.py` 또는 `.env`의 `EXTRA_FEEDS`에서 수정합니다. 추가한 피드가 죽으면 `ai-news status`의 소스 상태에 실패율로 드러납니다.
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+발송 실패 시 기사가 보존되는지, 정책이 실제로 랭킹을 바꾸는지, 모델이 잘못된 응답을 줘도 실행이 죽지 않는지를 포함해 35개 테스트가 루프 전체를 덮습니다.

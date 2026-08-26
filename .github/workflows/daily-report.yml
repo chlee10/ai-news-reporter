@@ -2,13 +2,18 @@ name: AI Daily Report
 
 on:
   schedule:
-    - cron: "0 23,3,8 * * *"
+    - cron: "0 23,3,8 * * *" # 08:00, 12:00, 17:00 Asia/Seoul
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
+
+# The harness carries state between runs, so two cycles must never overlap.
+concurrency:
+  group: ai-daily-report
+  cancel-in-progress: false
 
 jobs:
   report:
@@ -22,6 +27,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install .
+
       - name: Generate and send report
         run: ai-news run
         env:
@@ -30,6 +36,35 @@ jobs:
           REPORT_RECIPIENTS: ${{ secrets.REPORT_RECIPIENTS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REPORT_PUBLIC_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+
+      - name: Persist harness state
+        # Runs even when delivery failed, so the failure and the unsent stories both survive.
+        if: always()
+        run: |
+          if [ ! -f data/ai_news.db ]; then
+            echo "no state file produced; nothing to persist"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ai_news.db
+          if git diff --cached --quiet; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git commit -m "chore: persist AI news harness state [skip ci]"
+          git pull --rebase --autostash
+          git push
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-news-log
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: reports

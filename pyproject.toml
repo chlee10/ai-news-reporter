@@ -1,7 +1,7 @@
 [project]
 name = "ai-news-reporter"
-version = "0.1.0"
-description = "Daily Korean and global AI news intelligence report"
+version = "0.2.0"
+description = "Daily Korean and global AI news intelligence harness"
 requires-python = ">=3.11"
 dependencies = [
     "APScheduler>=3.10,<4",
@@ -13,7 +13,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-llm = ["openai>=1.0"]
 test = ["pytest>=8.0"]
 
 [project.scripts]
