@@ -290,3 +290,58 @@ def test_ai_signal_is_matched_in_korean_and_english_without_false_positives():
     assert is_ai_related(off_topic("OpenAI launches a chatbot"))
     assert not is_ai_related(off_topic("비가 내리는 주말 교통 상황"))
     assert not is_ai_related(off_topic("Spain said the rain will remain"))
+
+
+# ---------------------------------------------------------------- freshness floor
+
+
+def test_stories_past_the_freshness_floor_never_reach_the_report():
+    """A fortnight-old story must not fill the edition just because the pool ran dry."""
+    policy = EditorialPolicy(max_age_hours=168.0)
+    recent = story(article("AI 모델 신규 공개", age_hours=10))
+    stale = story(article("AI 모델 예전 소식", age_hours=360))
+    ranked = rank([recent, stale], policy)
+    assert [item.title for item in ranked] == ["AI 모델 신규 공개"]
+
+
+def test_the_edition_stays_short_rather_than_padding_with_old_stories():
+    policy = EditorialPolicy(report_size=12, max_age_hours=168.0)
+    stories = [story(article(f"AI 모델 최신 {i}", age_hours=5)) for i in range(3)]
+    stories += [story(article(f"AI 모델 구식 {i}", age_hours=400)) for i in range(20)]
+    selected = select(rank(stories, policy), policy)
+    assert len(selected) == 3
+
+
+def test_a_looser_floor_lets_older_stories_back_in():
+    old = story(article("AI 모델 소식", age_hours=300))
+    assert rank([old], EditorialPolicy(max_age_hours=168.0)) == []
+    assert len(rank([old], EditorialPolicy(max_age_hours=720.0))) == 1
+
+
+def test_metrics_count_what_the_floor_removed_and_the_target_it_missed():
+    policy = EditorialPolicy(report_size=12, max_age_hours=168.0)
+    fresh = [story(article("AI 모델 최신", age_hours=5))]
+    fresh += [story(article(f"AI 모델 구식 {i}", age_hours=400)) for i in range(4)]
+    selected = select(rank(fresh, policy), policy)
+    metrics = measure(datetime.now(UTC), CollectResult(), fresh, fresh, selected, policy)
+    assert metrics.stale_dropped == 4
+    assert metrics.target_size == 12
+    assert metrics.articles_selected == 1
+
+
+def test_a_short_edition_is_explained_in_the_next_policy_note():
+    improved = improve(base_metrics(articles_selected=5, target_size=12, stale_dropped=30), EditorialPolicy())
+    assert "신선한 신규 기사가 부족해 5/12건만 편성했습니다" in improved.note
+    assert "168시간 초과 30건 제외" in improved.note
+
+
+def test_a_full_edition_says_nothing_about_shortfall():
+    improved = improve(base_metrics(articles_selected=12, target_size=12), EditorialPolicy())
+    assert "부족해" not in improved.note
+
+
+def test_the_freshness_floor_survives_policy_revisions():
+    policy = EditorialPolicy(max_age_hours=96.0)
+    for _ in range(5):
+        policy = improve(base_metrics(domestic_selected=1), policy)
+    assert policy.max_age_hours == 96.0

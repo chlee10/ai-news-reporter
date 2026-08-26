@@ -18,6 +18,7 @@ class Article:
     score: float = 0.0
     body: str = ""
     detail_summary: str = ""
+    detail_points: tuple[str, ...] = ()
     signature: str = ""
     fingerprint: str = ""
     related_domains: int = 1
@@ -47,6 +48,7 @@ class EditorialPolicy:
     corroboration_weight: float = 0.15
     domestic_quota: int = 4
     report_size: int = 12
+    max_age_hours: float = 168.0  # a fortnight-old story must not fill the edition
     max_per_source: int = 3
     source_reliability: dict[str, float] = field(default_factory=dict)
     note: str = "초기 실행: 국내외 균형과 공식 출처 우선 원칙을 적용합니다."
@@ -81,6 +83,8 @@ class RunMetrics:
     stories_clustered: int = 0
     stories_new: int = 0
     articles_selected: int = 0
+    target_size: int = 0
+    stale_dropped: int = 0
     domestic_selected: int = 0
     source_diversity: int = 0
     median_age_hours: float = 0.0

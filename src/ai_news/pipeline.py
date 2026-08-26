@@ -193,6 +193,7 @@ def rank(stories: list[Story], policy: EditorialPolicy) -> list[Article]:
     now = datetime.now(UTC)
     ranked = []
     off_topic = 0
+    stale = 0
     for story in stories:
         article = story.representative
         if urlparse(article.url).scheme != "https" or not urlparse(article.url).netloc:
@@ -201,9 +202,12 @@ def rank(stories: list[Story], policy: EditorialPolicy) -> list[Article]:
         if not is_ai_related(article):
             off_topic += 1
             continue
+        age_hours = max(0.0, (now - article.published_at).total_seconds() / 3600)
+        if age_hours > policy.max_age_hours:
+            stale += 1
+            continue
         text = f"{article.title} {article.summary}".lower()
         topic = next((name for name, terms in TOPICS.items() if any(term in text for term in terms)), "other")
-        age_hours = max(0.0, (now - article.published_at).total_seconds() / 3600)
         freshness = max(0.1, 1 - age_hours / 168)
         corroboration = min(1.0, (len(story.domains) - 1) / 2)
         relevance = 1.0 if topic != "other" else 0.55
@@ -221,6 +225,10 @@ def rank(stories: list[Story], policy: EditorialPolicy) -> list[Article]:
         ranked.append(replace(article, topic=topic, score=score, related_domains=len(story.domains)))
     if off_topic:
         LOGGER.info("filtered out %s stories with no AI signal", off_topic)
+    if stale:
+        LOGGER.info(
+            "filtered out %s stories older than the %.0f-hour freshness floor", stale, policy.max_age_hours
+        )
     return sorted(ranked, key=lambda item: item.score, reverse=True)
 
 
@@ -264,10 +272,17 @@ def measure(
     stories: list[Story],
     fresh: list[Story],
     selected: list[Article],
+    policy: EditorialPolicy | None = None,
 ) -> RunMetrics:
     """Record what actually happened. Nothing here is derivable from a filter applied upstream."""
     now = datetime.now(UTC)
+    policy = policy or EditorialPolicy()
     ages = [max(0.0, (now - article.published_at).total_seconds() / 3600) for article in selected]
+    stale = sum(
+        1
+        for story in fresh
+        if (now - story.representative.published_at).total_seconds() / 3600 > policy.max_age_hours
+    )
     return RunMetrics(
         run_at=run_at,
         sources_ok=len(collected.ok_sources),
@@ -276,6 +291,8 @@ def measure(
         stories_clustered=len(stories),
         stories_new=len(fresh),
         articles_selected=len(selected),
+        target_size=policy.report_size,
+        stale_dropped=stale,
         domestic_selected=sum(article.region == "korea" for article in selected),
         source_diversity=len({article.source for article in selected}),
         median_age_hours=round(statistics.median(ages), 1) if ages else 0.0,
@@ -315,6 +332,11 @@ def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
         weights["freshness_weight"] -= 0.02
         weights["trust_weight"] += 0.02
 
+    if metrics.target_size and metrics.articles_selected < metrics.target_size:
+        notes.append(
+            f"신선한 신규 기사가 부족해 {metrics.articles_selected}/{metrics.target_size}건만 편성했습니다"
+            f"(신선도 하한 {policy.max_age_hours:.0f}시간 초과 {metrics.stale_dropped}건 제외)."
+        )
     if metrics.articles_selected and metrics.body_fetch_ratio < 0.6:
         notes.append(f"본문 수집률 {metrics.body_fetch_ratio:.0%} → 원문 접근이 막힌 매체를 감점합니다.")
     if metrics.translation_engine == "google":
@@ -337,6 +359,7 @@ def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
         **weights,
         domestic_quota=domestic_quota,
         report_size=policy.report_size,
+        max_age_hours=policy.max_age_hours,
         max_per_source=max_per_source,
         source_reliability=dict(policy.source_reliability),
         note=note,

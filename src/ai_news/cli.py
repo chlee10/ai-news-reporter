@@ -57,19 +57,25 @@ def run(dry_run: bool = False, force: bool = False, verbose: bool = False) -> st
         selected, summary_engine = summarize_article_bodies(selected)
 
         metrics = replace(
-            measure(run_at, collected, stories, fresh, selected),
+            measure(run_at, collected, stories, fresh, selected, policy),
             translation_engine=translation_engine,
             summary_engine=summary_engine,
             body_fetch_ok=sum(1 for article in selected if article.body),
             body_fetch_failed=sum(1 for article in selected if not article.body),
         )
 
-        write_web_report(selected, policy.note, metrics=metrics)
-        report_text, report_html = render_report(selected, policy.note, os.getenv("REPORT_PUBLIC_URL", ""))
+        web_report = Path("reports/index.html")
+        write_web_report(selected, policy.note, web_report, metrics)
+        report_text, report_html = render_report(
+            selected, policy.note, os.getenv("REPORT_PUBLIC_URL", ""), metrics
+        )
 
         if dry_run:
             print(report_text)
+            preview = web_report.with_name("email-preview.html")
+            preview.write_text(report_html, encoding="utf-8")
             LOGGER.info("dry run: nothing sent, dedup memory and policy left untouched")
+            LOGGER.info("email preview written to %s", preview)
             return report_text
 
         failure: Exception | None = None
@@ -78,7 +84,7 @@ def run(dry_run: bool = False, force: bool = False, verbose: bool = False) -> st
         else:
             try:
                 subject = f"[AI Daily Brief] {datetime.now().strftime('%Y-%m-%d')}"
-                send_gmail(subject, report_text, report_html)
+                send_gmail(subject, report_text, report_html, attachment=web_report)
                 metrics = replace(metrics, delivered=True)
             except Exception as error:  # smtplib raises several unrelated exception types
                 failure = error

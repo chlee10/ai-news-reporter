@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import smtplib
 from dataclasses import replace
+from datetime import datetime
 from email.message import EmailMessage
 from html import escape
 from pathlib import Path
@@ -45,13 +47,17 @@ SUMMARY_SCHEMA = {
             "type": "ARRAY",
             "items": {
                 "type": "OBJECT",
-                "properties": {"index": {"type": "INTEGER"}, "summary": {"type": "STRING"}},
-                "required": ["index", "summary"],
+                "properties": {
+                    "index": {"type": "INTEGER"},
+                    "points": {"type": "ARRAY", "items": {"type": "STRING"}},
+                },
+                "required": ["index", "points"],
             },
         }
     },
     "required": ["summaries"],
 }
+MIN_POINTS, MAX_POINTS = 3, 4
 
 
 # ---------------------------------------------------------------- source text
@@ -135,7 +141,7 @@ def translate_to_korean(articles: list[Article]) -> tuple[list[Article], str]:
 
 
 def summarize_article_bodies(articles: list[Article]) -> tuple[list[Article], str]:
-    """Produce a 2-3 sentence Korean brief per article. Returns the engine so the run can grade itself."""
+    """Produce a 3-4 point Korean outline per article. Returns the engine so the run can grade itself."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not articles:
         if articles:
@@ -146,9 +152,11 @@ def summarize_article_bodies(articles: list[Article]) -> tuple[list[Article], st
         for index, article in enumerate(articles)
     ]
     prompt = (
-        "Summarize each news article in Korean in 2 or 3 concise sentences. "
-        "Use only supplied text, preserve key entities and numbers, and return only JSON: "
-        '{"summaries":[{"index":0,"summary":"..."}]}.\n' + json.dumps(payload, ensure_ascii=False)
+        f"각 기사를 한국어 개조식으로 {MIN_POINTS}~{MAX_POINTS}개 항목으로 요약하라. "
+        "각 항목은 한 문장으로 쓰고 '~함', '~임', '~할 계획' 같은 명사형·축약형으로 끝낼 것. "
+        "항목마다 다른 논점을 다루고, 핵심 수치·기관명·제품명은 그대로 보존할 것. "
+        "제공된 본문에 없는 사실은 절대 추가하지 말 것. 불릿 기호는 붙이지 말 것.\n"
+        + json.dumps(payload, ensure_ascii=False)
     )
     content = _call_gemini(prompt, api_key, timeout=45.0, schema=SUMMARY_SCHEMA)
     parsed = _loads_forgiving(content) if content is not None else None
@@ -156,21 +164,55 @@ def summarize_article_bodies(articles: list[Article]) -> tuple[list[Article], st
         return _fallback_summaries(articles), "fallback"
     try:
         summaries = parsed["summaries"]
-        by_index = {item["index"]: item["summary"] for item in summaries if isinstance(item, dict)}
-    except (KeyError, TypeError, ValueError) as error:
+        by_index = {item["index"]: item["points"] for item in summaries if isinstance(item, dict)}
+    except (KeyError, TypeError) as error:
         LOGGER.error("Gemini summary payload was unusable: %s", error)
         return _fallback_summaries(articles), "fallback"
-    resolved = [
-        replace(article, detail_summary=str(by_index.get(index, article.summary))[:900])
-        for index, article in enumerate(articles)
-    ]
-    covered = sum(1 for index in range(len(articles)) if index in by_index)
-    LOGGER.info("Gemini summarized %s/%s articles", covered, len(articles))
+
+    resolved = []
+    covered = 0
+    for index, article in enumerate(articles):
+        points = _clean_points(by_index.get(index))
+        if points:
+            covered += 1
+        else:
+            points = _points_from_text(article.summary)
+        resolved.append(replace(article, detail_points=points, detail_summary=" ".join(points)[:900]))
+    LOGGER.info("Gemini summarized %s/%s articles into outline points", covered, len(articles))
     return resolved, "gemini" if covered else "fallback"
 
 
+def _clean_points(raw: object) -> tuple[str, ...]:
+    """Keep only usable outline points and strip any bullet glyph the model added anyway."""
+    if not isinstance(raw, list):
+        return ()
+    points = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip().lstrip("-•*·–—").strip()
+        if text:
+            points.append(text[:300])
+    return tuple(points[:MAX_POINTS])
+
+
+def _points_from_text(text: str) -> tuple[str, ...]:
+    """Split an RSS excerpt into outline points so the fallback still reads as an outline."""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?。])\s+|\n+", text or "") if part.strip()]
+    if not sentences:
+        return ()
+    return tuple(sentence[:300] for sentence in sentences[:MAX_POINTS])
+
+
 def _fallback_summaries(articles: list[Article]) -> list[Article]:
-    return [replace(article, detail_summary=article.summary[:550]) for article in articles]
+    return [
+        replace(
+            article,
+            detail_points=_points_from_text(article.summary[:550]),
+            detail_summary=article.summary[:550],
+        )
+        for article in articles
+    ]
 
 
 def _call_gemini(prompt: str, api_key: str, timeout: float, schema: dict | None = None) -> str | None:
@@ -263,42 +305,164 @@ def _translate_with_google(payload: list[dict[str, object]]) -> list[dict[str, o
 # ---------------------------------------------------------------- rendering
 
 
-def render_report(articles: list[Article], guidance: str, report_url: str = "") -> tuple[str, str]:
-    headlines = ", ".join(article.title for article in articles[:3]) or "검증을 통과한 신규 기사가 없습니다"
-    overview = f"오늘의 핵심 AI 뉴스 {len(articles)}건입니다. 주요 이슈는 {headlines}입니다. 국내외 정책, 모델, 산업 동향을 함께 선별했습니다."
-    text = ["AI Daily Brief", overview, f"편집 원칙: {guidance}", ""]
-    html = [
-        "<div style='max-width:720px;margin:auto;font-family:Arial,sans-serif;color:#1f2937;line-height:1.65'>",
-        "<h1 style='color:#0f766e'>AI Daily Brief</h1>",
-        f"<p style='font-size:16px'><strong>오늘의 요약</strong><br>{escape(overview)}</p>",
-        f"<p style='color:#4b5563'><strong>편집 원칙:</strong> {escape(guidance)}</p>",
-        "<h2 style='border-bottom:2px solid #99f6e4'>주요 뉴스</h2>",
+def outline_points(article: Article) -> tuple[str, ...]:
+    """The outline shown to the reader, falling back through every source of text we have."""
+    if article.detail_points:
+        return article.detail_points
+    fallback = article.detail_summary or article.summary[:550].strip()
+    return _points_from_text(fallback) or ("원문 본문을 가져오지 못했습니다.",)
+
+
+TOPIC_LABELS = {
+    "model": "모델",
+    "policy": "정책",
+    "industry": "산업",
+    "research": "연구",
+    "safety": "안전",
+    "other": "기타",
+}
+
+# Email clients are unreliable with <style> blocks — Gmail's mobile apps drop them entirely —
+# so every rule here is inlined, and the layout leans on tables rather than flex or grid.
+FONT = "-apple-system,'Segoe UI','Malgun Gothic','Apple SD Gothic Neo',Arial,sans-serif"
+INK, BODY, MUTED, HAIRLINE = "#111827", "#374151", "#6b7280", "#e8edf2"
+ACCENT, ACCENT_DARK, ACCENT_SOFT, CANVAS = "#0f766e", "#0b5c55", "#e6fffa", "#eef2f5"
+
+
+def topic_label(topic: str) -> str:
+    return TOPIC_LABELS.get(topic, topic)
+
+
+def _pill(label: str) -> str:
+    return (
+        f"<span style=\"display:inline-block;background:{ACCENT_SOFT};color:{ACCENT};"
+        f"font-size:11px;font-weight:700;letter-spacing:.02em;line-height:1;"
+        f"padding:5px 9px;border-radius:4px\">{escape(label)}</span>"
+    )
+
+
+def render_report(
+    articles: list[Article],
+    guidance: str,
+    report_url: str = "",
+    metrics: RunMetrics | None = None,
+) -> tuple[str, str]:
+    """Render the email. The outline is always inline: Gmail readers should never need a click."""
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+    domestic = sum(1 for article in articles if article.region == "korea")
+    counts: dict[str, int] = {}
+    for article in articles:
+        counts[article.topic] = counts.get(article.topic, 0) + 1
+    spread = " · ".join(f"{topic_label(topic)} {count}" for topic, count in
+                        sorted(counts.items(), key=lambda pair: -pair[1]))
+    # A short edition is a real signal, not a defect to hide: say why rather than padding it out.
+    shortfall = ""
+    if metrics is not None and metrics.target_size and len(articles) < metrics.target_size:
+        shortfall = f"신선한 신규 기사 기준 {len(articles)}/{metrics.target_size}건"
+
+    # ---- plain text ----
+    text = [
+        "AI Daily Brief",
+        f"{today} · 총 {len(articles)}건 (국내 {domestic} / 해외 {len(articles) - domestic})",
+        f"주제 분포: {spread}" if spread else "",
+        shortfall,
+        "",
     ]
-    for detail_number, article in enumerate(articles, start=1):
-        detail = article.detail_summary or article.summary[:550].strip() or "원문 본문을 가져오지 못했습니다."
-        corroboration = f" | 교차 보도 {article.related_domains}곳" if article.related_domains > 1 else ""
-        text.extend([f"## {detail_number}. {article.title}", detail, f"{article.source}: {article.url}"])
-        if report_url:
-            detail_link = f"{report_url.rstrip('/')}/#detail-{detail_number}"
-            html.append(
-                f"<section style='padding:14px 0;border-bottom:1px solid #d1d5db'>"
-                f"<h3>{detail_number}. {escape(article.title)}</h3>"
-                f"<p><small>{escape(article.source)}{escape(corroboration)} | "
-                f"<a href='{escape(detail_link, quote=True)}'>상세 요약 보기</a> | "
-                f"원문: <a href='{escape(article.url, quote=True)}'>출처 열기</a></small></p></section>"
-            )
-            continue
-        html.append(
-            f"<section id='detail-{detail_number}' style='padding:14px 0;border-bottom:1px solid #d1d5db'>"
-            f"<h3>{detail_number}. {escape(article.title)}</h3><p>{escape(detail)}</p>"
-            f"<p><small>{escape(article.source)} | 원문: <a href='{escape(article.url, quote=True)}'>출처 열기</a> | "
-            f"{escape(article.topic)}{escape(corroboration)}</small></p></section>"
+
+    # ---- html ----
+    parts = [
+        f"<div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">"
+        f"{escape(today)} AI 뉴스 {len(articles)}건 · 기사별 핵심을 개조식으로 정리했습니다.</div>",
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+        f"style=\"background:{CANVAS};padding:24px 12px;font-family:{FONT}\"><tr><td align='center'>",
+        f"<table role='presentation' width='960' cellpadding='0' cellspacing='0' "
+        f"style=\"width:100%;max-width:960px;background:#ffffff;border-radius:12px;overflow:hidden\">",
+        # header band
+        f"<tr><td style=\"background:{ACCENT};padding:28px 36px\">"
+        f"<div style=\"color:#a7f3ea;font-size:11px;font-weight:700;letter-spacing:.14em\">AI DAILY BRIEF</div>"
+        f"<div style=\"color:#ffffff;font-size:22px;font-weight:700;margin-top:6px\">{escape(today)}</div>"
+        f"<div style=\"color:#c4f5ee;font-size:13px;margin-top:8px\">"
+        f"총 {len(articles)}건 · 국내 {domestic} · 해외 {len(articles) - domestic}"
+        + (f" · {escape(spread)}" if spread else "")
+        + "</div>"
+        + (
+            f"<div style=\"color:#a7f3ea;font-size:12px;margin-top:6px\">{escape(shortfall)}</div>"
+            if shortfall
+            else ""
         )
+        + "</td></tr>",
+    ]
+
     if not articles:
+        parts.append(
+            f"<tr><td style=\"padding:36px 36px;color:{BODY};font-size:15px\">"
+            "검증을 통과한 신규 기사가 없습니다.</td></tr>"
+        )
         text.append("검증을 통과한 신규 기사가 없습니다.")
-        html.append("<p>검증을 통과한 신규 기사가 없습니다.</p>")
-    html.append("</div>")
-    return "\n".join(text), "".join(html)
+
+    for number, article in enumerate(articles, start=1):
+        points = outline_points(article)
+        label = topic_label(article.topic)
+        corroboration = f" · 교차 보도 {article.related_domains}곳" if article.related_domains > 1 else ""
+
+        text.append(f"[{number}] {article.title}")
+        text.extend(f"  - {point}" for point in points)
+        text.append(f"  {article.source} · {label}{corroboration}")
+        text.append(f"  원문: {article.url}")
+        text.append("")
+
+        bullets = "".join(
+            f"<tr>"
+            f"<td valign='top' style=\"width:14px;color:{ACCENT};font-size:16px;line-height:1.8;"
+            f"padding:0 0 8px\">·</td>"
+            f"<td style=\"color:{BODY};font-size:15.5px;line-height:1.8;padding:0 0 9px\">"
+            f"{escape(point)}</td></tr>"
+            for point in points
+        )
+        divider = "" if number == 1 else f"border-top:1px solid {HAIRLINE};"
+        parts.append(
+            f"<tr><td style=\"{divider}padding:26px 36px 24px\">"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>"
+            f"<td valign='top' style=\"width:30px;padding:2px 12px 0 0\">"
+            f"<div style=\"width:26px;height:26px;background:{ACCENT_SOFT};color:{ACCENT};"
+            f"border-radius:13px;font-size:12px;font-weight:700;text-align:center;line-height:26px\">"
+            f"{number}</div></td>"
+            f"<td valign='top'>"
+            f"<div style=\"color:{INK};font-size:18px;font-weight:700;line-height:1.5;"
+            f"margin:0 0 10px\">{escape(article.title)}</div>"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+            f"style=\"margin:0 0 12px\">{bullets}</table>"
+            f"<div style=\"font-size:12.5px;color:{MUTED};line-height:1.6\">{_pill(label)}"
+            f"<span style=\"padding-left:8px\">{escape(article.source)}{escape(corroboration)}</span>"
+            f"<span style=\"padding:0 6px;color:#cbd5e1\">|</span>"
+            f"<a href=\"{escape(article.url, quote=True)}\" "
+            f"style=\"color:{ACCENT};font-weight:600;text-decoration:none\">출처 열기 &rarr;</a>"
+            f"</div></td></tr></table></td></tr>"
+        )
+
+    footer = [f"<div style=\"margin:0 0 6px\"><strong style=\"color:{BODY}\">편집 원칙</strong> {escape(guidance)}</div>"]
+    text.append(f"편집 원칙: {guidance}")
+    if metrics is not None:
+        footer.append(
+            f"<div style=\"margin:0 0 6px\">수집 {metrics.articles_collected}건 → 신규 "
+            f"{metrics.stories_new}건 → 선정 {metrics.articles_selected}건 · 출처 "
+            f"{metrics.source_diversity}곳 · 본문 수집률 {metrics.body_fetch_ratio:.0%} · "
+            f"번역 {escape(metrics.translation_engine)}</div>"
+        )
+    if report_url and articles:
+        link = report_url.rstrip("/")
+        footer.append(
+            f"<div style=\"margin-top:10px\"><a href=\"{escape(link, quote=True)}\" "
+            f"style=\"color:{ACCENT};font-weight:600;text-decoration:none\">웹에서 보기 &rarr;</a></div>"
+        )
+        text.extend(["", f"웹에서 보기: {link}"])
+    parts.append(
+        f"<tr><td style=\"border-top:1px solid {HAIRLINE};background:#fafbfc;padding:20px 36px;"
+        f"color:{MUTED};font-size:12px;line-height:1.65\">{''.join(footer)}</td></tr>"
+    )
+
+    parts.append("</table></td></tr></table>")
+    return "\n".join(line for line in text if line is not None), "".join(parts)
 
 
 def write_web_report(
@@ -307,72 +471,101 @@ def write_web_report(
     path: Path = Path("reports/index.html"),
     metrics: RunMetrics | None = None,
 ) -> None:
-    """Write a browser report with native expandable details and this run's quality panel."""
+    """Write a browser report whose items open as popups, and this run's quality panel.
+
+    The popup is driven by the CSS :target selector rather than a script, so it works in
+    every browser, from a downloaded attachment, and with JavaScript disabled. The small
+    script only adds Escape-to-close on top of that.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     headlines = ", ".join(article.title for article in articles[:3]) or "검증을 통과한 신규 기사가 없습니다"
     overview = f"오늘의 핵심 AI 뉴스 {len(articles)}건입니다. 주요 이슈는 {headlines}입니다."
-    sections = []
+
+    rows = []
+    modals = []
     for number, article in enumerate(articles, start=1):
-        detail = article.detail_summary or article.summary[:550].strip() or "원문 본문을 가져오지 못했습니다."
+        points = outline_points(article)
+        teaser = points[0] if len(points[0]) <= 90 else points[0][:90].rstrip() + "…"
         corroboration = f" · 교차 보도 {article.related_domains}곳" if article.related_domains > 1 else ""
-        # The whole header row is the toggle; <details> keeps it working with JavaScript disabled.
-        sections.append(
-            f"<details id='detail-{number}' class='item'{' open' if number == 1 else ''}>"
-            f"<summary><span class='num'>{number}</span>"
-            f"<span class='headline'>{escape(article.title)}</span>"
-            f"<span class='chev' aria-hidden='true'></span></summary>"
-            f"<div class='body'><p class='detail'>{escape(detail)}</p>"
-            f"<p class='meta'><span class='tag'>{escape(article.topic)}</span>{escape(article.source)}"
-            f"{escape(corroboration)} · "
-            f"<a href='{escape(article.url, quote=True)}' target='_blank' rel='noopener'>출처 열기 ↗</a></p></div>"
-            "</details>"
+        meta = f"{article.source}{corroboration}"
+        rows.append(
+            f"<li class='row'><a class='open' href='#detail-{number}'>"
+            f"<span class='num'>{number}</span>"
+            f"<span class='text'><span class='headline'>{escape(article.title)}</span>"
+            f"<span class='teaser'>{escape(teaser)}</span>"
+            f"<span class='meta'><span class='tag'>{escape(topic_label(article.topic))}</span>{escape(meta)}</span></span>"
+            f"<span class='cue' aria-hidden='true'>＋</span></a></li>"
         )
-    body = "".join(sections) or "<p>검증을 통과한 신규 기사가 없습니다.</p>"
-    controls = (
-        "<div class='controls'><button type='button' data-open='1'>모두 펼치기</button>"
-        "<button type='button' data-open='0'>모두 접기</button></div>"
-        if articles
-        else ""
-    )
+        modals.append(
+            f"<div class='modal' id='detail-{number}' role='dialog' aria-modal='true' "
+            f"aria-labelledby='title-{number}'>"
+            f"<a class='backdrop' href='#close' aria-label='닫기'></a>"
+            f"<div class='card'>"
+            f"<a class='x' href='#close' aria-label='닫기'>×</a>"
+            f"<p class='eyebrow'><span class='tag'>{escape(topic_label(article.topic))}</span>"
+            f"{escape(meta)}</p>"
+            f"<h3 id='title-{number}'>{number}. {escape(article.title)}</h3>"
+            f"<ul class='detail'>{''.join(f'<li>{escape(point)}</li>' for point in points)}</ul>"
+            f"<p class='actions'>"
+            f"<a class='primary' href='{escape(article.url, quote=True)}' target='_blank' rel='noopener'>"
+            f"원문 열기 ↗</a>"
+            f"<a class='ghost' href='#close'>닫기</a></p>"
+            f"</div></div>"
+        )
+
+    body = f"<ol class='list'>{''.join(rows)}</ol>" if rows else "<p>검증을 통과한 신규 기사가 없습니다.</p>"
     page = f"""<!doctype html>
 <html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>AI Daily Brief</title><style>
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f0fdfa;color:#172033;font-family:-apple-system,'Segoe UI','Malgun Gothic',Arial,sans-serif;line-height:1.7}}
 main{{max-width:760px;margin:36px auto;padding:0 20px}}
-h1{{color:#0f766e;margin:0 0 18px}}h2{{color:#134e4a;margin:32px 0 8px;padding-bottom:8px;border-bottom:2px solid #99f6e4}}
+h1{{color:#0f766e;margin:0 0 18px}}
+h2{{color:#134e4a;margin:32px 0 12px;padding-bottom:8px;border-bottom:2px solid #99f6e4}}
 .intro{{background:#fff;padding:20px;border-left:4px solid #14b8a6;border-radius:0 6px 6px 0}}
-.controls{{display:flex;gap:8px;margin:12px 0 4px}}
-.controls button{{font:inherit;font-size:13px;padding:6px 12px;border:1px solid #99f6e4;background:#fff;color:#0f766e;border-radius:999px;cursor:pointer}}
-.controls button:hover{{background:#ccfbf1}}
-.item{{background:#fff;margin:10px 0;border:1px solid #ccfbf1;border-radius:8px;overflow:hidden}}
-.item[open]{{border-color:#5eead4;box-shadow:0 1px 3px rgba(15,118,110,.12)}}
-summary{{display:flex;align-items:center;gap:12px;cursor:pointer;padding:14px 18px;font-weight:700;color:#0f766e;list-style:none}}
-summary::-webkit-details-marker{{display:none}}
-summary:hover{{background:#f0fdfa}}
-summary:focus-visible{{outline:2px solid #14b8a6;outline-offset:-2px}}
-.num{{flex:none;width:26px;height:26px;border-radius:50%;background:#ccfbf1;color:#0f766e;font-size:13px;display:flex;align-items:center;justify-content:center}}
-.headline{{flex:1}}
-.chev{{flex:none;width:9px;height:9px;border-right:2px solid #14b8a6;border-bottom:2px solid #14b8a6;transform:rotate(45deg);transition:transform .18s;margin-right:4px}}
-.item[open] .chev{{transform:rotate(-135deg)}}
-.body{{padding:0 18px 16px 56px}}
-.detail{{margin:0 0 10px}}
-.meta{{color:#4b5563;font-size:13px;margin:0}}
+.hint{{color:#4b5563;font-size:13px;margin:0 0 12px}}
+.list{{list-style:none;margin:0;padding:0}}
+.row{{margin:10px 0}}
+.open{{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;background:#fff;border:1px solid #ccfbf1;border-radius:8px;text-decoration:none;color:inherit}}
+.open:hover{{border-color:#5eead4;box-shadow:0 1px 3px rgba(15,118,110,.14)}}
+.open:focus-visible{{outline:2px solid #14b8a6;outline-offset:2px}}
+.num{{flex:none;width:26px;height:26px;margin-top:2px;border-radius:50%;background:#ccfbf1;color:#0f766e;font-size:13px;display:flex;align-items:center;justify-content:center}}
+.text{{flex:1;min-width:0}}
+.headline{{display:block;font-weight:700;color:#0f766e}}
+.teaser{{display:block;color:#334155;font-size:14px;margin-top:2px}}
+.meta{{display:block;color:#4b5563;font-size:12.5px;margin-top:4px}}
 .tag{{display:inline-block;background:#f0fdfa;border:1px solid #ccfbf1;border-radius:4px;padding:1px 7px;margin-right:8px;font-size:12px;color:#0f766e}}
-a{{color:#0f766e}}
+.cue{{flex:none;color:#14b8a6;font-size:18px;line-height:1.4}}
+.modal{{display:none;position:fixed;inset:0;z-index:50;align-items:center;justify-content:center;padding:20px}}
+.modal:target{{display:flex}}
+.backdrop{{position:absolute;inset:0;background:rgba(15,23,42,.55)}}
+.card{{position:relative;background:#fff;border-radius:12px;max-width:640px;width:100%;max-height:85vh;overflow:auto;padding:26px 28px;box-shadow:0 18px 44px rgba(15,23,42,.28)}}
+.x{{position:absolute;top:12px;right:16px;font-size:26px;line-height:1;color:#64748b;text-decoration:none}}
+.x:hover{{color:#0f766e}}
+.eyebrow{{margin:0 0 6px;color:#4b5563;font-size:13px}}
+.card h3{{margin:0 0 14px;color:#0f766e;padding-right:28px}}
+.card .detail{{margin:0 0 20px;padding-left:20px}}
+.card .detail li{{margin:0 0 8px}}
+.actions{{margin:0;display:flex;gap:10px;flex-wrap:wrap}}
+.actions a{{font-size:14px;text-decoration:none;border-radius:999px;padding:8px 18px}}
+.primary{{background:#0f766e;color:#fff}}
+.primary:hover{{background:#115e59}}
+.ghost{{border:1px solid #ccfbf1;color:#0f766e}}
+.ghost:hover{{background:#f0fdfa}}
 .quality{{margin-top:28px;padding:16px;background:#fff;border:1px dashed #99f6e4;color:#4b5563;font-size:13px;border-radius:8px}}
 .quality ul{{margin:8px 0 0;padding-left:18px}}
-@media (max-width:520px){{.body{{padding-left:18px}}}}
+a{{color:#0f766e}}
 </style></head><body><main>
 <h1>AI Daily Brief</h1>
 <div class='intro'><strong>오늘의 요약</strong><br>{escape(overview)}<br><small>편집 원칙: {escape(guidance)}</small></div>
-<h2>주요 뉴스</h2>{controls}{body}{_quality_panel(metrics)}
-</main><script>
-document.querySelectorAll('.controls button').forEach(function (button) {{
-  button.addEventListener('click', function () {{
-    var open = button.dataset.open === '1';
-    document.querySelectorAll('details.item').forEach(function (item) {{ item.open = open; }});
-  }});
+<h2>주요 뉴스</h2>
+<p class='hint'>제목을 클릭하면 상세 내용이 팝업으로 열립니다.</p>
+{body}{_quality_panel(metrics)}
+</main>{''.join(modals)}<script>
+document.addEventListener('keydown', function (event) {{
+  if (event.key === 'Escape' && location.hash && location.hash !== '#close') {{
+    location.hash = '#close';
+  }}
 }});
 </script></body></html>"""
     path.write_text(page, encoding="utf-8")
@@ -395,7 +588,9 @@ def _quality_panel(metrics: RunMetrics | None) -> str:
 # ---------------------------------------------------------------- delivery
 
 
-def send_gmail(subject: str, text: str, html: str) -> None:
+def send_gmail(subject: str, text: str, html: str, attachment: Path | None = None) -> None:
+    """Send the brief. Gmail strips scripts and <details>, so the interactive copy rides along
+    as an attachment: opening it gives the reader the popup view without any hosting."""
     username = os.environ["GMAIL_USERNAME"]
     password = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
     recipients = [address.strip() for address in os.environ["REPORT_RECIPIENTS"].split(",") if address.strip()]
@@ -407,6 +602,19 @@ def send_gmail(subject: str, text: str, html: str) -> None:
     message["To"] = ", ".join(recipients)
     message.set_content(text)
     message.add_alternative(html, subtype="html")
+    if attachment is not None:
+        try:
+            payload = attachment.read_text(encoding="utf-8")
+        except OSError as error:
+            LOGGER.warning("interactive report not attached (%s): %s", attachment, error)
+        else:
+            message.add_attachment(
+                payload.encode("utf-8"),
+                maintype="text",
+                subtype="html",
+                filename=f"AI-Daily-Brief-{datetime.now().strftime('%Y-%m-%d')}.html",
+            )
+            LOGGER.info("attached the interactive report (%s KB)", round(len(payload.encode()) / 1024))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(username, password)
         smtp.send_message(message)
