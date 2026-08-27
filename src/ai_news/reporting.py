@@ -333,9 +333,10 @@ def topic_label(topic: str) -> str:
     return TOPIC_LABELS.get(topic, topic)
 
 
-def _pill(label: str) -> str:
+def _pill(label: str, tone: str = "accent") -> str:
+    background, colour = (ACCENT_SOFT, ACCENT) if tone == "accent" else ("#fef3c7", "#92400e")
     return (
-        f"<span style=\"display:inline-block;background:{ACCENT_SOFT};color:{ACCENT};"
+        f"<span style=\"display:inline-block;background:{background};color:{colour};"
         f"font-size:11px;font-weight:700;letter-spacing:.02em;line-height:1;"
         f"padding:5px 9px;border-radius:4px\">{escape(label)}</span>"
     )
@@ -404,8 +405,9 @@ def render_report(
         points = outline_points(article)
         label = topic_label(article.topic)
         corroboration = f" · 교차 보도 {article.related_domains}곳" if article.related_domains > 1 else ""
+        repeat = _pill("재등장", "warn") + "&nbsp;" if article.times_sent else ""
 
-        text.append(f"[{number}] {article.title}")
+        text.append(f"[{number}] {'(재등장) ' if article.times_sent else ''}{article.title}")
         text.extend(f"  - {point}" for point in points)
         text.append(f"  {article.source} · {label}{corroboration}")
         text.append(f"  원문: {article.url}")
@@ -432,7 +434,7 @@ def render_report(
             f"margin:0 0 10px\">{escape(article.title)}</div>"
             f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
             f"style=\"margin:0 0 12px\">{bullets}</table>"
-            f"<div style=\"font-size:12.5px;color:{MUTED};line-height:1.6\">{_pill(label)}"
+            f"<div style=\"font-size:12.5px;color:{MUTED};line-height:1.6\">{repeat}{_pill(label)}"
             f"<span style=\"padding-left:8px\">{escape(article.source)}{escape(corroboration)}</span>"
             f"<span style=\"padding:0 6px;color:#cbd5e1\">|</span>"
             f"<a href=\"{escape(article.url, quote=True)}\" "

@@ -22,6 +22,7 @@ class Article:
     signature: str = ""
     fingerprint: str = ""
     related_domains: int = 1
+    times_sent: int = 0  # 0 means never delivered; higher means it has repeated before
 
 
 @dataclass(frozen=True)
@@ -46,13 +47,21 @@ class EditorialPolicy:
     freshness_weight: float = 0.25
     relevance_weight: float = 0.20
     corroboration_weight: float = 0.15
-    domestic_quota: int = 4
-    report_size: int = 12
+    # Regional balance is structural, not a nudge: each region gets its own slots.
+    region_quota: dict[str, int] = field(default_factory=lambda: {"korea": 10, "global": 10})
     max_age_hours: float = 168.0  # a fortnight-old story must not fill the edition
+    repeat_penalty: float = 0.55  # score multiplier applied per previous delivery
     max_per_source: int = 3
     source_reliability: dict[str, float] = field(default_factory=dict)
     note: str = "초기 실행: 국내외 균형과 공식 출처 우선 원칙을 적용합니다."
     revision: int = 0
+
+    @property
+    def report_size(self) -> int:
+        return sum(self.region_quota.values())
+
+    def quota(self, region: str) -> int:
+        return self.region_quota.get(region, 0)
 
     def reliability(self, source: str) -> float:
         return self.source_reliability.get(source, 1.0)
@@ -68,6 +77,9 @@ class EditorialPolicy:
             return cls()
         if not isinstance(data, dict):
             return cls()
+        # Older policies stored an auto-tuned domestic floor. Regional quotas are configuration
+        # rather than something the loop tunes, so a stale tuned value must not be inherited:
+        # dropping the unknown key falls through to the configured default.
         fields = {f for f in cls.__dataclass_fields__}
         return cls(**{key: value for key, value in data.items() if key in fields})
 
@@ -84,6 +96,7 @@ class RunMetrics:
     stories_new: int = 0
     articles_selected: int = 0
     target_size: int = 0
+    repeats_included: int = 0
     stale_dropped: int = 0
     domestic_selected: int = 0
     source_diversity: int = 0

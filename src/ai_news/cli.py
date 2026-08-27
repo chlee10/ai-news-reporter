@@ -13,7 +13,7 @@ from .pipeline import (
     adjust_reliability,
     cluster_stories,
     collect,
-    filter_new,
+    annotate_history,
     improve,
     measure,
     rank,
@@ -48,16 +48,15 @@ def run(dry_run: bool = False, force: bool = False, verbose: bool = False) -> st
         for name, error in collected.failures.items():
             store.record_source(name, ok=False, error=error)
 
-        stories = cluster_stories(collected.articles)
-        fresh = filter_new(stories, store, force)
-        selected = select(rank(fresh, policy), policy)
+        stories = annotate_history(cluster_stories(collected.articles), store, force)
+        selected = select(rank(stories, policy), policy)
 
         selected, translation_engine = translate_to_korean(selected)
         selected, body_outcomes = enrich_with_article_bodies(selected)
         selected, summary_engine = summarize_article_bodies(selected)
 
         metrics = replace(
-            measure(run_at, collected, stories, fresh, selected, policy),
+            measure(run_at, collected, stories, selected, policy),
             translation_engine=translation_engine,
             summary_engine=summary_engine,
             body_fetch_ok=sum(1 for article in selected if article.body),
@@ -118,8 +117,10 @@ def status(limit: int = 5, verbose: bool = False) -> None:
         print(f"  revision        : {policy.revision}")
         print(f"  가중치          : 신뢰도 {policy.trust_weight} / 최신성 {policy.freshness_weight} / "
               f"관련성 {policy.relevance_weight} / 교차보도 {policy.corroboration_weight}")
-        print(f"  국내 최소 편성  : {policy.domestic_quota}건, 매체당 상한 {policy.max_per_source}건, "
-              f"리포트 {policy.report_size}건")
+        quota = " / ".join(f"{region} {count}건" for region, count in sorted(policy.region_quota.items()))
+        print(f"  지역 정원       : {quota} (총 {policy.report_size}건)")
+        print(f"  매체당 상한     : {policy.max_per_source}건 · 신선도 하한 {policy.max_age_hours:.0f}시간 "
+              f"· 재발송 감점 {policy.repeat_penalty}")
         print(f"  개선 메모       : {policy.note}")
         downgraded = {name: value for name, value in policy.source_reliability.items() if value < 1.0}
         if downgraded:

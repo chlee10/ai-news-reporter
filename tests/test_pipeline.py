@@ -8,7 +8,7 @@ from ai_news.pipeline import (
     adjust_reliability,
     cluster_stories,
     fingerprint_of,
-    filter_new,
+    annotate_history,
     improve,
     measure,
     rank,
@@ -40,8 +40,12 @@ def article(
     )
 
 
-def story(item: Article, *others: Article) -> Story:
-    return Story(item, [item, *others])
+def story(item: Article, *others: Article, times_sent: int = 0) -> Story:
+    return Story(item, [item, *others], times_sent)
+
+
+def fresh_only(stories):
+    return [item for item in stories if not item.is_repeat]
 
 
 # ---------------------------------------------------------------- deduplication
@@ -77,23 +81,44 @@ def test_corroboration_counts_distinct_domains_not_repeat_posts(tmp_path):
     assert scores["Meta opens Llama weights"] > scores["Nvidia unveils new chip"]
 
 
-def test_delivered_story_is_not_repeated_by_another_outlet(tmp_path):
+def test_a_delivered_story_returning_from_another_outlet_counts_as_a_repeat(tmp_path):
     store = NewsStore(tmp_path / "news.db")
     first = article("Google launches Gemini 3 Ultra", source="Google AI", domain="blog.google")
     store.commit_delivery([first])
     republished = story(article("Google launches Gemini 3 Ultra for developers", source="ZDNet", domain="zdnet.co.kr"))
-    assert filter_new([republished], store) == []
-    assert filter_new([republished], store, force=True) == [republished]
+    assert annotate_history([republished], store)[0].is_repeat
+    assert annotate_history([republished], store, force=True)[0].times_sent == 0
 
 
-def test_undelivered_story_survives_for_the_next_run(tmp_path):
-    """A failed send must never consume a story: nothing is marked until delivery succeeds."""
+def test_undelivered_story_stays_unsent_until_delivery_succeeds(tmp_path):
+    """A failed send must never consume a story: nothing is counted until delivery succeeds."""
     store = NewsStore(tmp_path / "news.db")
     pending = story(article("Samsung expands HBM capacity", region="korea"))
-    assert filter_new([pending], store) == [pending]
-    assert filter_new([pending], store) == [pending]
+    assert annotate_history([pending], store)[0].times_sent == 0
+    assert annotate_history([pending], store)[0].times_sent == 0
     store.commit_delivery([pending.representative])
-    assert filter_new([pending], store) == []
+    assert annotate_history([pending], store)[0].times_sent == 1
+
+
+def test_every_delivery_of_the_same_story_deepens_its_penalty(tmp_path):
+    store = NewsStore(tmp_path / "news.db")
+    item = article("Naver ships an AI model", region="korea")
+    for expected in (1, 2, 3):
+        store.commit_delivery([item])
+        assert annotate_history([story(item)], store)[0].times_sent == expected
+
+    policy = EditorialPolicy(repeat_penalty=0.5)
+    scores = [rank([story(item, times_sent=n)], policy)[0].score for n in (0, 1, 2)]
+    assert scores[0] > scores[1] > scores[2]
+    assert round(scores[1] / scores[0], 2) == 0.5
+
+
+def test_a_stale_tuned_quota_is_not_inherited_from_an_older_policy():
+    """Regional quotas are configuration; an old auto-tuned floor must not silently override it."""
+    old = '{"domestic_quota": 2, "report_size": 12, "revision": 6, "max_per_source": 2}'
+    policy = EditorialPolicy.from_json(old)
+    assert policy.region_quota == {"korea": 10, "global": 10}
+    assert policy.revision == 6 and policy.max_per_source == 2
 
 
 def test_legacy_database_is_migrated_in_place(tmp_path):
@@ -124,22 +149,31 @@ def test_policy_weights_actually_change_the_ranking():
     assert rank([fresh_but_weak, trusted_but_old], trust_first)[0].title == "Official AI policy statement"
 
 
-def test_selection_honours_domestic_quota_and_per_source_cap():
-    policy = EditorialPolicy(report_size=8, domestic_quota=3, max_per_source=2)
+def test_each_region_gets_exactly_its_own_quota():
+    policy = EditorialPolicy(region_quota={"korea": 3, "global": 5}, max_per_source=2)
     ranked = rank(
-        [story(article(f"Global AI model {index}", source="TechCrunch", domain="techcrunch.com")) for index in range(10)]
-        + [story(article(f"국내 AI 모델 {index}", "korea", source="ZDNet Korea", domain="zdnet.co.kr")) for index in range(5)],
+        [story(article(f"Global AI model {i}", source=f"Outlet {i}", domain=f"o{i}.com")) for i in range(10)]
+        + [story(article(f"국내 AI 모델 {i}", "korea", source=f"매체 {i}", domain=f"k{i}.co.kr")) for i in range(5)],
         policy,
     )
     selected = select(ranked, policy)
     assert len(selected) == 8
-    assert sum(item.region == "korea" for item in selected) >= 3
+    assert sum(item.region == "korea" for item in selected) == 3
+    assert sum(item.region == "global" for item in selected) == 5
 
 
-def test_selection_relaxes_the_cap_rather_than_shipping_a_thin_report():
-    policy = EditorialPolicy(report_size=5, domestic_quota=0, max_per_source=2)
-    ranked = rank([story(article(f"AI model story {index}")) for index in range(6)], policy)
-    assert len(select(ranked, policy)) == 5
+def test_a_regions_quota_outranks_the_per_source_cap_when_outlets_are_few():
+    policy = EditorialPolicy(region_quota={"korea": 4, "global": 0}, max_per_source=2)
+    ranked = rank(
+        [story(article(f"국내 AI 모델 {i}", "korea", source="AI타임스", domain="aitimes.com")) for i in range(6)],
+        policy,
+    )
+    assert len(select(ranked, policy)) == 4
+
+
+def test_report_size_is_the_sum_of_the_region_quotas():
+    assert EditorialPolicy().report_size == 20
+    assert EditorialPolicy(region_quota={"korea": 3, "global": 4}).report_size == 7
 
 
 def test_selection_of_nothing_is_empty():
@@ -174,12 +208,13 @@ def base_metrics(**overrides) -> RunMetrics:
     return RunMetrics(**{**defaults, **overrides})
 
 
-def test_low_domestic_share_raises_the_quota_for_the_next_run():
-    policy = EditorialPolicy(domestic_quota=4)
-    improved = improve(base_metrics(domestic_selected=1), policy)
-    assert improved.domestic_quota == 5
-    assert improved.revision == 1
-    assert "국내" in improved.note
+def test_region_quotas_are_structural_and_survive_policy_revisions():
+    """Balance is enforced by the quota, so no feedback nudge should move it."""
+    policy = EditorialPolicy(region_quota={"korea": 10, "global": 10})
+    for _ in range(5):
+        policy = improve(base_metrics(domestic_selected=1), policy)
+    assert policy.region_quota == {"korea": 10, "global": 10}
+    assert policy.revision == 5
 
 
 def test_concentrated_sources_tighten_the_per_source_cap():
@@ -225,7 +260,7 @@ def test_policy_survives_a_round_trip_through_the_store(tmp_path):
     store.save_run(metrics, improve(metrics, store.load_policy()))
     reloaded = store.load_policy()
     assert reloaded.revision == 1
-    assert reloaded.domestic_quota == 5
+    assert reloaded.region_quota == {"korea": 10, "global": 10}
     assert store.recent_runs(1)[0]["metrics"]["articles_selected"] == 12
 
 
@@ -239,7 +274,7 @@ def test_metrics_describe_the_whole_run_not_a_filter_that_already_ran():
         failures={"Dead Feed": "timeout"},
     )
     selected = [article("a", "korea", source="ZDNet Korea", age_hours=4), article("b", source="OpenAI", age_hours=8)]
-    metrics = measure(datetime.now(UTC), collected, [story(item) for item in selected], [], selected)
+    metrics = measure(datetime.now(UTC), collected, [story(item) for item in selected], selected)
     assert metrics.sources_ok == 2 and metrics.sources_failed == 1
     assert metrics.domestic_ratio == 0.5
     assert metrics.source_diversity == 2
@@ -276,7 +311,7 @@ def off_topic(title: str, region: str = "korea") -> Article:
 
 
 def test_general_tech_feed_cannot_smuggle_an_off_topic_item_into_the_report():
-    policy = EditorialPolicy(report_size=5, domestic_quota=3)
+    policy = EditorialPolicy(region_quota={"korea": 3, "global": 0})
     ranked = rank([story(off_topic("화장실 요금 성차별 논란")), story(article("국내 AI 모델 공개", "korea"))], policy)
     assert [item.title for item in ranked] == ["국내 AI 모델 공개"]
     assert select(ranked, policy) == ranked
@@ -304,12 +339,12 @@ def test_stories_past_the_freshness_floor_never_reach_the_report():
     assert [item.title for item in ranked] == ["AI 모델 신규 공개"]
 
 
-def test_the_edition_stays_short_rather_than_padding_with_old_stories():
-    policy = EditorialPolicy(report_size=12, max_age_hours=168.0)
+def test_stale_stories_never_pad_the_edition_even_when_it_is_short():
+    """Repeats may fill a gap; stories past the freshness floor may not."""
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 12}, max_age_hours=168.0)
     stories = [story(article(f"AI 모델 최신 {i}", age_hours=5)) for i in range(3)]
     stories += [story(article(f"AI 모델 구식 {i}", age_hours=400)) for i in range(20)]
-    selected = select(rank(stories, policy), policy)
-    assert len(selected) == 3
+    assert len(select(rank(stories, policy), policy)) == 3
 
 
 def test_a_looser_floor_lets_older_stories_back_in():
@@ -319,11 +354,11 @@ def test_a_looser_floor_lets_older_stories_back_in():
 
 
 def test_metrics_count_what_the_floor_removed_and_the_target_it_missed():
-    policy = EditorialPolicy(report_size=12, max_age_hours=168.0)
-    fresh = [story(article("AI 모델 최신", age_hours=5))]
-    fresh += [story(article(f"AI 모델 구식 {i}", age_hours=400)) for i in range(4)]
-    selected = select(rank(fresh, policy), policy)
-    metrics = measure(datetime.now(UTC), CollectResult(), fresh, fresh, selected, policy)
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 12}, max_age_hours=168.0)
+    stories = [story(article("AI 모델 최신", age_hours=5))]
+    stories += [story(article(f"AI 모델 구식 {i}", age_hours=400)) for i in range(4)]
+    selected = select(rank(stories, policy), policy)
+    metrics = measure(datetime.now(UTC), CollectResult(), stories, selected, policy)
     assert metrics.stale_dropped == 4
     assert metrics.target_size == 12
     assert metrics.articles_selected == 1
@@ -345,3 +380,51 @@ def test_the_freshness_floor_survives_policy_revisions():
     for _ in range(5):
         policy = improve(base_metrics(domestic_selected=1), policy)
     assert policy.max_age_hours == 96.0
+
+
+# ---------------------------------------------------------------- always-full editions
+
+
+def test_repeats_fill_the_quota_only_after_fresh_stories_run_out():
+    """The edition is always full, but nothing repeats while something new is available."""
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 5}, max_per_source=5)
+    stories = [story(article(f"AI 신규 {i}", age_hours=3)) for i in range(2)]
+    stories += [story(article(f"AI 기존 {i}", age_hours=3), times_sent=1) for i in range(8)]
+    selected = select(rank(stories, policy), policy)
+
+    assert len(selected) == 5
+    assert sum(1 for item in selected if not item.times_sent) == 2
+    assert sum(1 for item in selected if item.times_sent) == 3
+
+
+def test_a_fresh_story_always_outranks_a_repeat_of_similar_quality():
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 1}, max_per_source=5)
+    weaker_fresh = story(article("AI 신규 소식", trust=0.7, age_hours=40))
+    stronger_repeat = story(article("AI 기존 소식", trust=1.0, age_hours=2), times_sent=1)
+    selected = select(rank([stronger_repeat, weaker_fresh], policy), policy)
+    assert [item.title for item in selected] == ["AI 신규 소식"]
+
+
+def test_the_least_repeated_story_is_reused_first():
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 2}, max_per_source=5)
+    stories = [story(article(f"AI 소식 {n}", trust=1.0, age_hours=3), times_sent=n) for n in (3, 1, 2)]
+    selected = select(rank(stories, policy), policy)
+    assert sorted(item.times_sent for item in selected) == [1, 2]
+
+
+def test_metrics_and_policy_note_report_how_many_repeats_were_used():
+    policy = EditorialPolicy(region_quota={"korea": 0, "global": 4}, max_per_source=5)
+    stories = [story(article("AI 신규", age_hours=3))]
+    stories += [story(article(f"AI 기존 {i}", age_hours=3), times_sent=1) for i in range(5)]
+    selected = select(rank(stories, policy), policy)
+    metrics = measure(datetime.now(UTC), CollectResult(), stories, selected, policy)
+
+    assert metrics.articles_selected == 4
+    assert metrics.repeats_included == 3
+    assert metrics.stories_new == 1
+    assert "이전 발송분 3건을 재편성했습니다" in improve(metrics, policy).note
+
+
+def test_a_fully_fresh_edition_mentions_no_repeats():
+    metrics = base_metrics(repeats_included=0, articles_selected=20, target_size=20)
+    assert "재편성" not in improve(metrics, EditorialPolicy()).note

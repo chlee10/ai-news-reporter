@@ -58,6 +58,11 @@ class Story:
 
     representative: Article
     members: list[Article]
+    times_sent: int = 0
+
+    @property
+    def is_repeat(self) -> bool:
+        return self.times_sent > 0
 
     @property
     def domains(self) -> set[str]:
@@ -160,23 +165,33 @@ def cluster_stories(articles: list[Article]) -> list[Story]:
     return stories
 
 
-def filter_new(stories: list[Story], store: NewsStore, force: bool = False) -> list[Story]:
-    """Drop stories already delivered, including the same event republished by another outlet."""
+def annotate_history(stories: list[Story], store: NewsStore, force: bool = False) -> list[Story]:
+    """Tag how often each story has gone out instead of dropping it.
+
+    The edition is always filled: a repeat is allowed in when new supply runs short, but it
+    is scored down once per previous delivery so it never outranks something fresh.
+    """
     if force:
-        LOGGER.warning("--force in effect: dedup memory ignored for this run")
-        return stories
-    known = store.known_fingerprints()
+        LOGGER.warning("--force in effect: delivery history ignored for this run")
+        return [replace_story(story, 0) for story in stories]
+    counts = store.sent_counts()
     recent = store.recent_signatures()
-    fresh = []
+    annotated = []
     for story in stories:
-        if any(member.fingerprint in known for member in story.members):
-            continue
-        if any(similarity(story.signature, seen) >= SIMILARITY_THRESHOLD for _, seen in recent):
-            LOGGER.debug("cross-outlet duplicate skipped: %s", story.representative.title)
-            continue
-        fresh.append(story)
-    LOGGER.info("%s/%s stories are new since the last delivery", len(fresh), len(stories))
-    return fresh
+        times = max((counts.get(member.fingerprint, 0) for member in story.members), default=0)
+        if times == 0 and any(
+            similarity(story.signature, seen) >= SIMILARITY_THRESHOLD for _, seen in recent
+        ):
+            # Another outlet rewriting a story we already sent counts as a repeat, not as new.
+            times = 1
+        annotated.append(replace_story(story, times))
+    new_count = sum(1 for story in annotated if not story.is_repeat)
+    LOGGER.info("%s/%s stories are new since the last delivery", new_count, len(stories))
+    return annotated
+
+
+def replace_story(story: Story, times_sent: int) -> Story:
+    return Story(story.representative, story.members, times_sent)
 
 
 # ---------------------------------------------------------------- ranking
@@ -212,17 +227,22 @@ def rank(stories: list[Story], policy: EditorialPolicy) -> list[Article]:
         corroboration = min(1.0, (len(story.domains) - 1) / 2)
         relevance = 1.0 if topic != "other" else 0.55
         trust = min(1.0, article.trust * policy.reliability(article.source))
-        score = round(
-            100
-            * (
-                policy.trust_weight * trust
-                + policy.freshness_weight * freshness
-                + policy.relevance_weight * relevance
-                + policy.corroboration_weight * corroboration
-            ),
-            1,
+        score = 100 * (
+            policy.trust_weight * trust
+            + policy.freshness_weight * freshness
+            + policy.relevance_weight * relevance
+            + policy.corroboration_weight * corroboration
         )
-        ranked.append(replace(article, topic=topic, score=score, related_domains=len(story.domains)))
+        score = round(score * policy.repeat_penalty ** story.times_sent, 1)
+        ranked.append(
+            replace(
+                article,
+                topic=topic,
+                score=score,
+                related_domains=len(story.domains),
+                times_sent=story.times_sent,
+            )
+        )
     if off_topic:
         LOGGER.info("filtered out %s stories with no AI signal", off_topic)
     if stale:
@@ -233,33 +253,43 @@ def rank(stories: list[Story], policy: EditorialPolicy) -> list[Article]:
 
 
 def select(ranked: list[Article], policy: EditorialPolicy) -> list[Article]:
-    """Fill the domestic quota first, then the rest, capping how much any single outlet can occupy."""
+    """Fill each region's quota. Fresh stories go first; repeats top up whatever is left."""
     if not ranked:
         return []
     chosen: list[Article] = []
     per_source: dict[str, int] = {}
 
-    def take(candidates: list[Article], limit: int, cap: int) -> None:
-        remaining = limit
+    def take(candidates: list[Article], limit: int, cap: int) -> int:
+        taken = 0
         for article in candidates:
-            if len(chosen) >= policy.report_size or remaining <= 0:
-                return
+            if taken >= limit:
+                break
             if per_source.get(article.source, 0) >= cap or article in chosen:
                 continue
             chosen.append(article)
             per_source[article.source] = per_source.get(article.source, 0) + 1
-            remaining -= 1
+            taken += 1
+        return taken
 
-    # The domestic quota is a floor, so it outranks the per-source cap when few outlets cover Korea.
-    domestic = [article for article in ranked if article.region == "korea"]
-    take(domestic, policy.domestic_quota, max(policy.max_per_source, policy.domestic_quota))
-    take(ranked, policy.report_size - len(chosen), policy.max_per_source)
-    if len(chosen) < policy.report_size:
-        LOGGER.warning(
-            "only %s/%s slots filled under a %s-per-source cap; relaxing the cap for this run",
-            len(chosen), policy.report_size, policy.max_per_source,
+    for region, quota in policy.region_quota.items():
+        if quota <= 0:
+            continue
+        pool = [article for article in ranked if article.region == region]
+        fresh = [article for article in pool if not article.times_sent]
+        repeats = sorted(
+            (article for article in pool if article.times_sent),
+            key=lambda item: (item.times_sent, -item.score),
         )
-        take(ranked, policy.report_size - len(chosen), policy.report_size)
+        filled = take(fresh, quota, policy.max_per_source)
+        if filled < quota:
+            filled += take(repeats, quota - filled, policy.max_per_source)
+        if filled < quota:
+            # Few outlets cover this region, so the per-source cap yields to the quota.
+            filled += take(fresh + repeats, quota - filled, quota)
+        if filled < quota:
+            LOGGER.warning(
+                "%s quota short: %s/%s slots filled from %s candidates", region, filled, quota, len(pool)
+            )
     return sorted(chosen, key=lambda item: item.score, reverse=True)
 
 
@@ -270,7 +300,6 @@ def measure(
     run_at: datetime,
     collected: CollectResult,
     stories: list[Story],
-    fresh: list[Story],
     selected: list[Article],
     policy: EditorialPolicy | None = None,
 ) -> RunMetrics:
@@ -278,9 +307,10 @@ def measure(
     now = datetime.now(UTC)
     policy = policy or EditorialPolicy()
     ages = [max(0.0, (now - article.published_at).total_seconds() / 3600) for article in selected]
+    unsent = [story for story in stories if not story.is_repeat]
     stale = sum(
         1
-        for story in fresh
+        for story in unsent
         if (now - story.representative.published_at).total_seconds() / 3600 > policy.max_age_hours
     )
     return RunMetrics(
@@ -289,9 +319,10 @@ def measure(
         sources_failed=len(collected.failures),
         articles_collected=len(collected.articles),
         stories_clustered=len(stories),
-        stories_new=len(fresh),
+        stories_new=len(unsent),
         articles_selected=len(selected),
         target_size=policy.report_size,
+        repeats_included=sum(1 for article in selected if article.times_sent),
         stale_dropped=stale,
         domestic_selected=sum(article.region == "korea" for article in selected),
         source_diversity=len({article.source for article in selected}),
@@ -302,7 +333,6 @@ def measure(
 def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
     """Turn measurements into the next run's policy. This is the step that makes it a harness."""
     notes: list[str] = []
-    domestic_quota = policy.domestic_quota
     max_per_source = policy.max_per_source
     weights = {
         "trust_weight": policy.trust_weight,
@@ -310,13 +340,6 @@ def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
         "relevance_weight": policy.relevance_weight,
         "corroboration_weight": policy.corroboration_weight,
     }
-
-    if metrics.articles_selected and metrics.domestic_ratio < 0.25:
-        domestic_quota = min(6, domestic_quota + 1)
-        notes.append(f"국내 비중 {metrics.domestic_ratio:.0%} → 국내 최소 편성을 {domestic_quota}건으로 상향합니다.")
-    elif metrics.domestic_ratio > 0.5:
-        domestic_quota = max(2, domestic_quota - 1)
-        notes.append(f"국내 비중 {metrics.domestic_ratio:.0%} → 해외 동향 비중을 회복합니다.")
 
     if metrics.articles_selected and metrics.source_diversity < 5:
         max_per_source = max(2, max_per_source - 1)
@@ -332,6 +355,10 @@ def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
         weights["freshness_weight"] -= 0.02
         weights["trust_weight"] += 0.02
 
+    if metrics.repeats_included:
+        notes.append(
+            f"신규 기사가 부족해 이전 발송분 {metrics.repeats_included}건을 재편성했습니다."
+        )
     if metrics.target_size and metrics.articles_selected < metrics.target_size:
         notes.append(
             f"신선한 신규 기사가 부족해 {metrics.articles_selected}/{metrics.target_size}건만 편성했습니다"
@@ -357,9 +384,9 @@ def improve(metrics: RunMetrics, policy: EditorialPolicy) -> EditorialPolicy:
     note = " ".join(notes) or "지표가 목표 범위 안에 있습니다. 공식 출처 우선과 교차 검증 기조를 유지합니다."
     next_policy = EditorialPolicy(
         **weights,
-        domestic_quota=domestic_quota,
-        report_size=policy.report_size,
+        region_quota=dict(policy.region_quota),
         max_age_hours=policy.max_age_hours,
+        repeat_penalty=policy.repeat_penalty,
         max_per_source=max_per_source,
         source_reliability=dict(policy.source_reliability),
         note=note,

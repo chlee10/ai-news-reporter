@@ -32,6 +32,9 @@ class NewsStore:
             if column not in existing:
                 cursor.execute(f"ALTER TABLE seen ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
                 LOGGER.info("migrated seen table: added column %s", column)
+        if "times_sent" not in existing:
+            cursor.execute("ALTER TABLE seen ADD COLUMN times_sent INTEGER NOT NULL DEFAULT 1")
+            LOGGER.info("migrated seen table: added column times_sent")
         cursor.execute("CREATE INDEX IF NOT EXISTS seen_at_idx ON seen(seen_at)")
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS runs ("
@@ -57,15 +60,32 @@ class NewsStore:
     def known_fingerprints(self) -> set[str]:
         return {row["fingerprint"] for row in self.connection.execute("SELECT fingerprint FROM seen")}
 
+    def sent_counts(self) -> dict[str, int]:
+        """How often each story has already gone out, so repeats lose ground to fresher ones."""
+        return {
+            row["fingerprint"]: row["times_sent"]
+            for row in self.connection.execute("SELECT fingerprint, times_sent FROM seen")
+        }
+
     def commit_delivery(self, articles: list[Article]) -> None:
-        """Called only after the report has actually been delivered, so a failed send never loses a story."""
+        """Called only after the report has actually been delivered, so a failed send never loses a story.
+
+        A repeat bumps times_sent instead of being ignored, which is what makes each further
+        repeat score lower than the last.
+        """
         now = datetime.now(UTC).isoformat()
         self.connection.executemany(
-            "INSERT OR IGNORE INTO seen (fingerprint, seen_at, signature, url, source) VALUES (?, ?, ?, ?, ?)",
-            [(article.fingerprint, now, article.signature, article.url, article.source) for article in articles],
+            "INSERT INTO seen (fingerprint, seen_at, signature, url, source, times_sent) "
+            "VALUES (?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(fingerprint) DO UPDATE SET times_sent = times_sent + 1, seen_at = ?",
+            [
+                (article.fingerprint, now, article.signature, article.url, article.source, now)
+                for article in articles
+            ],
         )
         self.connection.commit()
-        LOGGER.info("committed %s delivered stories to dedup memory", len(articles))
+        repeats = sum(1 for article in articles if article.times_sent)
+        LOGGER.info("committed %s delivered stories (%s repeats) to dedup memory", len(articles), repeats)
 
     def prune(self, days: int = 90) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()

@@ -472,3 +472,13 @@ def test_a_full_edition_shows_no_shortfall_line():
     metrics = RunMetrics(run_at=datetime.now(UTC), articles_selected=3, target_size=3)
     _, html = render_report(_sample(3), "원칙", "", metrics)
     assert "신선한 신규 기사 기준" not in html
+
+
+def test_a_repeated_story_is_labelled_so_the_reader_is_never_misled():
+    from dataclasses import replace as dc_replace
+
+    items = _sample(2)
+    items[1] = dc_replace(items[1], times_sent=2)
+    text, html = render_report(items, "원칙")
+    assert html.count("재등장") == 1
+    assert "(재등장) 기사 1" in text
