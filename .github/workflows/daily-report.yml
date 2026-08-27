@@ -1,8 +1,10 @@
 name: AI Daily Report
 
+# Paused. The daily schedule is intentionally absent: this workflow now runs only when
+# someone starts it by hand. To resume, restore:
+#   schedule:
+#     - cron: "0 23,3,8 * * *" # 08:00, 12:00, 17:00 Asia/Seoul
 on:
-  schedule:
-    - cron: "0 23,3,8 * * *" # 08:00, 12:00, 17:00 Asia/Seoul
   workflow_dispatch:
 
 permissions:

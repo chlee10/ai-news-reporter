@@ -1,6 +1,8 @@
 # AI News Reporter
 
-매일 오전 8시, 정오, 오후 5시(Asia/Seoul)에 국내외 AI 뉴스를 수집해 중복 제거, 출처 검증, 중요도 평가, 리포트 생성, Gmail 발송까지 수행합니다.
+> **⏸ 현재 중지 상태입니다.** 자동 스케줄을 제거했으므로 리포트는 발송되지 않습니다. 손으로 실행할 때만 동작합니다 — 재개 방법은 [운영 재개](#운영-재개) 참고.
+
+국내외 AI 뉴스를 수집해 중복 제거, 출처 검증, 중요도 평가, 리포트 생성, Gmail 발송까지 수행합니다.
 
 리포트는 **국내 10건 + 해외 10건**으로 고정 편성됩니다. 신규 기사가 모자라면 이전 발송분이 자리를 메우되 재발송 횟수만큼 감점되고 `재등장`으로 표시되므로, 신규가 있는 한 신규가 먼저 나갑니다.
 
@@ -25,10 +27,11 @@ ai-news run --dry-run    # 리포트만 출력. 발송·중복기록·정책갱�
 ai-news run --force      # 중복 기억을 무시하고 한 번 재발송
 ai-news run --verbose    # 디버그 로그
 ai-news status           # 현재 편집 정책, 최근 실행 지표, 소스 상태
-ai-news schedule         # 08:00, 12:00, 17:00 KST 상주 실행
 ```
 
-`--dry-run`은 `reports/email-preview.html`에 실제 메일 HTML을 남기므로 발송 전에 브라우저로 모양을 확인할 수 있습니다. 로그는 stderr와 `logs/ai-news.log`(1MB 로테이션, 3세대)에 함께 남습니다. `schedule`은 항상 켜져 있는 서버/PC용이며, GitHub Actions나 Task Scheduler를 쓸 경우 `ai-news run`을 해당 시각에 걸면 됩니다.
+`--dry-run`은 `reports/email-preview.html`에 실제 메일 HTML을 남기므로 발송 전에 브라우저로 모양을 확인할 수 있습니다. 로그는 stderr와 `logs/ai-news.log`(1MB 로테이션, 3세대)에 함께 남습니다.
+
+**자동 실행은 없습니다.** `ai-news run`은 실행할 때만 동작하며, 상주 스케줄러(`ai-news schedule`)는 제거했습니다.
 
 ## 하네스 루프
 
@@ -73,7 +76,7 @@ ai-news schedule         # 08:00, 12:00, 17:00 KST 상주 실행
 
 ## GitHub Pages 배포 (선택)
 
-`.github/workflows/daily-report.yml`이 같은 리포트를 GitHub Pages에도 배포합니다. `REPORT_PUBLIC_URL`이 설정되면 메일 푸터에 `웹에서 보기` 링크가 한 줄 붙습니다 — 본문 요약은 그대로 들어가므로 링크는 어디까지나 부가 기능입니다. 웹 리포트 하단에는 그날 실행의 품질 지표 패널이 나옵니다.
+`.github/workflows/daily-report.yml`이 같은 리포트를 GitHub Pages에도 배포합니다. **현재 이 워크플로에는 스케줄 트리거가 없어 수동 실행할 때만 동작합니다.** `REPORT_PUBLIC_URL`이 설정되면 메일 푸터에 `웹에서 보기` 링크가 한 줄 붙습니다 — 본문 요약은 그대로 들어가므로 링크는 어디까지나 부가 기능입니다. 웹 리포트 하단에는 그날 실행의 품질 지표 패널이 나옵니다.
 
 설정: GitHub에 저장소를 만든 뒤 Pages의 Source를 **GitHub Actions**로 지정하고, Actions secrets에 `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`, `REPORT_RECIPIENTS`, `GEMINI_API_KEY`를 등록합니다.
 
@@ -86,6 +89,15 @@ ai-news schedule         # 08:00, 12:00, 17:00 KST 상주 실행
 `src/ai_news/sources.py` 또는 `.env`의 `EXTRA_FEEDS`에서 수정합니다. 추가한 피드가 죽으면 `ai-news status`의 소스 상태에 실패율로 드러납니다.
 
 현재 16곳(해외 12 · 국내 4)입니다. **해외 피드 처리량이 병목입니다** — 국내는 하루 55건 내외로 새 기사가 나오는 반면 해외는 20건 수준입니다. 하루 3회 실행하면 해외 정원 30칸에 신규 공급이 못 미쳐 뒤쪽 회차일수록 재등장이 늘어납니다. 재등장 비율이 계속 높으면 해외 피드를 더 늘리거나 실행 횟수를 줄이는 편이 낫습니다.
+
+## 운영 재개
+
+1. `.github/workflows/daily-report.yml` 상단 주석에 적힌 `schedule:` 블록을 `on:` 아래에 되살립니다. cron은 UTC 기준이며 `0 23,3,8 * * *`가 08:00·12:00·17:00 KST입니다.
+2. 커밋·푸시하면 다음 예정 시각부터 다시 발송됩니다.
+
+중지 기간에도 저장소의 `data/ai_news.db`는 그대로 남아 있으므로, 재개하면 발송 이력과 편집 정책이 끊긴 지점부터 이어집니다. 다만 중지가 길어지면 신선도 하한(168시간) 때문에 그동안 쌓인 기사 대부분이 제외되고, 첫 회차는 재등장 없이 신규만으로 채워집니다.
+
+한 번만 돌려보려면 GitHub의 `Actions → AI Daily Report → Run workflow`를 쓰거나 로컬에서 `ai-news run`을 실행합니다.
 
 ## Tests
 

@@ -5,7 +5,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 
 from .observability import configure_logging, get_logger
@@ -153,7 +152,7 @@ def status(limit: int = 5, verbose: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI news daily reporting harness")
-    parser.add_argument("command", choices=("run", "schedule", "status"))
+    parser.add_argument("command", choices=("run", "status"))
     parser.add_argument("--dry-run", action="store_true", help="Render the report without sending or recording it")
     parser.add_argument("--force", action="store_true", help="Ignore dedup memory for a one-off resend")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
@@ -163,27 +162,7 @@ def main() -> None:
     if args.command == "run":
         run(args.dry_run, args.force, args.verbose)
         return
-    if args.command == "status":
-        status(args.limit, args.verbose)
-        return
-
-    logger = configure_logging(args.verbose)
-    scheduler = BlockingScheduler(timezone="Asia/Seoul")
-    scheduler.add_job(
-        run,
-        "cron",
-        hour="8,12,17",
-        minute=0,
-        id="ai-news-report",
-        replace_existing=True,
-        misfire_grace_time=1800,
-        coalesce=True,
-    )
-    logger.info("scheduler started: 08:00, 12:00, 17:00 Asia/Seoul")
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    status(args.limit, args.verbose)
 
 
 if __name__ == "__main__":
